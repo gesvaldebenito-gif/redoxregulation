@@ -1,0 +1,276 @@
+# Human PCW3 scRNA-seq (Seurat)
+
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(dplyr)
+  library(ggplot2)
+  library(openxlsx)
+})
+
+ 
+data_dir <- "/Human In Vivo scRNA"
+setwd(data_dir)
+
+ seurat_data <- Read10X(data.dir = data_dir)
+
+ human_PCW3 <- CreateSeuratObject(seurat_data, project = "Human_PCW3")
+DefaultAssay(human_PCW3) <- "RNA"
+
+ rownames(human_PCW3) <- make.unique(rownames(human_PCW3))
+ 
+ human_PCW3[["percent.mt"]] <- PercentageFeatureSet(human_PCW3, pattern = "^MT-")
+
+# OPTIONAL: visualize QC (comment out if not needed)
+# VlnPlot(human_PCW3, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# Filters you usually use: nFeature_RNA > 200, < 6000; nCount_RNA < 50k; percent.mt < 10
+human_PCW3 <- subset(
+  human_PCW3,
+  subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & nCount_RNA < 50000 & percent.mt < 10
+)
+
+ 
+human_PCW3 <- NormalizeData(human_PCW3, normalization.method = "LogNormalize", scale.factor = 10000, verbose = FALSE)
+human_PCW3 <- FindVariableFeatures(human_PCW3, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+
+human_PCW3 <- ScaleData(
+  human_PCW3,
+  features = VariableFeatures(human_PCW3),
+  vars.to.regress = c("percent.mt", "nCount_RNA"),
+  verbose = FALSE
+)
+
+human_PCW3 <- RunPCA(human_PCW3, features = VariableFeatures(human_PCW3))
+# ElbowPlot(human_PCW3)
+
+
+
+ 
+human_PCW3 <- FindNeighbors(human_PCW3, dims = 1:20)
+human_PCW3 <- FindClusters(human_PCW3, resolution = 0.2)
+
+ human_PCW3 <- RunUMAP(human_PCW3, dims = 1:20, seed.use = 123)
+
+p_umap <- DimPlot(human_PCW3, label = TRUE, repel = TRUE)
+print(p_umap)
+
+ 
+human_PCW3_open <- RunUMAP(
+  human_PCW3,
+  dims = 1:30,
+  n.neighbors = 35,           
+  min.dist = 5,               
+  spread = 5,                
+  repulsion.strength = 1.0,   
+  metric = "cosine",
+  seed.use = 123
+)
+
+p_umap_open <- DimPlot(human_PCW3_open, label = FALSE, repel = FALSE, pt.size = 1.8, raster = TRUE) +
+  ggtitle(NULL) + theme_void() + theme(legend.position = "none")
+print(p_umap_open)
+
+
+out_png1 <- file.path(data_dir, "PCW3_UMAP_labelled.png")
+out_pdf1 <- file.path(data_dir, "PCW3_UMAP_labelled.pdf")
+
+ggsave(out_png1, plot = p_umap, device = "png", width = 10, height = 10, units = "in", dpi = 600, bg = "white")
+ggsave(out_pdf1, plot = p_umap, device = "pdf", width = 10, height = 10, units = "in", dpi = 300, bg = "white")
+
+out_png2 <- file.path(data_dir, "PCW3_UMAP_open_clean.png")
+out_pdf2 <- file.path(data_dir, "PCW3_UMAP_open_clean.pdf")
+
+ggsave(out_png2, plot = p_umap_open, device = "png", width = 10, height = 10, units = "in", dpi = 600, bg = "white")
+ggsave(out_pdf2, plot = p_umap_open, device = "pdf", width = 10, height = 10, units = "in", dpi = 300, bg = "white")
+
+message("✅ Saved UMAPs to:", "\n ", out_png1, "\n ", out_pdf1, "\n ", out_png2, "\n ", out_pdf2)
+
+ 
+Idents(human_PCW3) <- human_PCW3$seurat_clusters
+
+ 
+if (requireNamespace("future", quietly = TRUE)) {
+  library(future)
+  plan(strategy = "multisession", workers = max(1, parallel::detectCores() - 1))
+}
+
+markers <- FindAllMarkers(
+  human_PCW3,
+  only.pos = TRUE,
+  min.pct = 0.10,
+  logfc.threshold = 0.15,
+  test.use = "wilcox"
+)
+
+markers <- markers %>% arrange(cluster, p_val_adj)
+
+top50 <- markers %>% group_by(cluster) %>% slice_max(order_by = avg_log2FC, n = 100, with_ties = FALSE) %>% ungroup()
+
+xlsx_path <- file.path(data_dir, "PCW3_Markers.xlsx")
+wb <- createWorkbook()
+addWorksheet(wb, "Top100_all_clusters")
+writeData(wb, "Top100_all_clusters", top50)
+
+for (cl in unique(markers$cluster)) {
+  sh <- gsub("[\\/:?*\\[\\]]", "_", substr(paste0("Cluster_", cl), 1, 31))
+  addWorksheet(wb, sh)
+  writeData(wb, sh, dplyr::filter(markers, cluster == cl))
+}
+
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+message("✅ Marker Excel saved: ", xlsx_path)
+
+# If parallel plan was set, reset politely
+if ("future" %in% .packages(all.available = TRUE)) {
+  try(future::plan(sequential), silent = TRUE)
+}
+
+# If parallel plan was set, reset politely
+if ("future" %in% .packages(all.available = TRUE)) {
+  try(future::plan(sequential), silent = TRUE)
+}
+ # Resolve a gene name (human symbol or ENSG[.version]) to a feature in the object
+resolve_feature_human <- function(GENE, seu_obj) {
+  rn <- rownames(seu_obj)
+  
+  # 1) Direct symbol match (case-insensitive)
+  feat <- rn[toupper(rn) == toupper(GENE)]
+  
+  # 2) If input looks like an Ensembl ID, match after stripping version suffix
+  if (length(feat) == 0 && grepl("^ENSG", toupper(GENE))) {
+    rn_base <- sub("\\..*$", "", rn)
+    feat <- rn[rn_base == sub("\\..*$", "", GENE)]
+  }
+  
+  if (length(feat) == 0) stop("Gene not found in object: ", GENE)
+  feat[1]
+}
+
+# Minimal, clean FeaturePlot (no title/legend/axes)
+plot_gene_clean <- function(seu_obj, gene_feature) {
+  FeaturePlot(
+    seu_obj,
+    features = gene_feature,
+    pt.size = 1.5,
+    order = TRUE,
+    raster = TRUE,
+    min.cutoff = "q05",
+    max.cutoff = "q95"
+  ) +
+    ggtitle(NULL) +
+    theme_void() +
+    theme(legend.position = "none", plot.title = element_blank())
+}
+
+# === Run for one gene ===
+GENE <- "gpd2"  # change here
+feat <- resolve_feature_human(GENE, human_PCW3)
+
+# Use the opened layout if it exists; otherwise the baseline
+obj_plot <- if (exists("human_PCW3_open")) human_PCW3_open else human_PCW3
+
+# Quick on-screen check (clean)
+p <- plot_gene_clean(obj_plot, feat)
+print(p)
+cat("✅ Plotted gene:", GENE, "→ feature used:", feat, "\n")
+
+# === Save high-res with custom color scale (light grey → pink → red) ===
+out_png <- file.path(data_dir, paste0("PCW3_one_gene_", GENE, "_highres.png"))
+
+p_gene <- FeaturePlot(
+  obj_plot,
+  features = feat,
+  pt.size = 2,
+  order = TRUE,
+  raster = FALSE,
+  min.cutoff = "q05",
+  max.cutoff = "q95"
+) +
+  scale_color_gradientn(
+    colours = c("lightgrey", "purple", "purple"),  # grey → pink → red
+    limits  = c(NA, NA),
+    name    = NULL
+  ) +
+  ggtitle(NULL) +
+  theme_void() +
+  theme(legend.position = "none", plot.title = element_blank())
+
+ggsave(
+  filename = out_png,
+  plot = p_gene,
+  device = "png",
+  width = 10, height = 10, units = "in",
+  dpi = 600, bg = "white"
+)
+
+message("✅ Saved PCW3 one-gene UMAP (grey→pink→red) to: ", out_png)
+
+ # --- Cluster assignments based on your PCW3 markers ---
+ecto_clusters <- c("3", "4", "6")
+meso_clusters <- c("0", "1")
+endo_clusters <- c("2", "7", "8")
+
+# --- Assign germ layer identity on the TRUE object name ---
+cl_char <- as.character(human_PCW3$seurat_clusters)
+germ <- ifelse(cl_char %in% meso_clusters, "Mesoderm",
+               ifelse(cl_char %in% ecto_clusters, "Ectoderm",
+                      ifelse(cl_char %in% endo_clusters, "Endoderm", "Unclear")))
+human_PCW3$germ_layer <- factor(germ, levels = c("Endoderm","Mesoderm","Ectoderm","Unclear"))
+
+cat("Cells per germ layer (human_PCW3):\n")
+print(table(human_PCW3$germ_layer))
+
+# If you want to plot the opened layout, carry the label over
+if (exists("human_PCW3_open")) {
+  human_PCW3_open$germ_layer <- human_PCW3$germ_layer[Cells(human_PCW3_open)]
+  obj_plot <- human_PCW3_open
+} else {
+  obj_plot <- human_PCW3
+}
+
+# --- Palette ---
+cols_germ <- c(
+  "Endoderm" = "#E64B35",
+  "Mesoderm" = "#4DBBD5",
+  "Ectoderm" = "#00A087",
+  "Unclear"  = "grey80"
+)
+
+# --- ONE merged UMAP (no legend) ---
+p_germ <- DimPlot(
+  obj_plot,
+  group.by = "germ_layer",
+  label = FALSE,
+  pt.size = 1,
+  raster = FALSE,   # vector-friendly for hi-res
+  cols = cols_germ
+) +
+  ggtitle(NULL) +
+  theme_void() +
+  theme(legend.position = "none")
+
+print(p_germ)
+
+# --- Save high-resolution figure (PNG + PDF) ---
+out_dir <- data_dir
+merged_png <- file.path(out_dir, "PCW3_UMAP_germ_layers_merged.png")
+merged_pdf <- file.path(out_dir, "PCW3_UMAP_germ_layers_merged.pdf")
+
+ggsave(
+  merged_png,
+  plot = p_germ,
+  device = "png",
+  width = 10, height = 10, units = "in",
+  dpi = 600, bg = "white"
+)
+ggsave(
+  merged_pdf,
+  plot = p_germ,
+  device = "pdf",
+  width = 10, height = 10, units = "in",
+  dpi = 600, bg = "white"
+)
+
+message("✅ Saved merged germ-layer UMAP for PCW3 to: ", merged_png)
+
