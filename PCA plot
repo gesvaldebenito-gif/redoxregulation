@@ -1,0 +1,83 @@
+library(readxl)
+library(dplyr)
+library(ggplot2)
+
+file_path <- "b_PSC_batchcorrected_fpkm_orthologous.xlsx"
+
+# Read
+dat <- read_excel(file_path)
+
+# Gene names
+gene_names <- dat[[1]]
+
+# Expression (B to G)
+expr <- as.data.frame(dat[, 2:7])
+
+# Make numeric
+for (i in seq_along(expr)) {
+  expr[[i]] <- as.numeric(expr[[i]])
+}
+
+# Unique rownames
+gene_names_unique <- make.unique(gene_names)
+rownames(expr) <- gene_names_unique
+
+# Matrix
+expr_mat <- as.matrix(expr)
+
+# Remove genes with zero variance across samples (cannot be used in PCA)
+gene_var <- apply(expr_mat, 1, var, na.rm = TRUE)
+expr_mat_filt <- expr_mat[gene_var > 0, , drop = FALSE]
+
+# Transpose: rows = samples, cols = genes
+mat_t <- t(expr_mat_filt)
+
+# Metadata
+sample_names <- rownames(mat_t)
+species <- c(rep("Mouse", 3), rep("Human", 3))
+meta <- data.frame(sample = sample_names, species = species)
+
+# PCA
+pca <- prcomp(mat_t, scale. = TRUE)
+
+# Variance explained
+var_expl <- (pca$sdev^2) / sum(pca$sdev^2) * 100
+
+# Plot df
+pca_df <- data.frame(pca$x, meta)
+
+# Plot
+ggplot(pca_df, aes(x = PC1, y = PC2, color = species, label = sample)) +
+  geom_point(size = 4) +
+  geom_text(vjust = -0.8, size = 3) +
+  xlab(paste0("PC1 (", round(var_expl[1], 1), "%)")) +
+  ylab(paste0("PC2 (", round(var_expl[2], 1), "%)")) +
+  theme_bw() +
+  theme(
+    text = element_text(size = 12),
+    panel.grid = element_blank()
+  )
+
+# Save PCA coordinates (PC1, PC2, etc.) with metadata
+pca_export <- data.frame(Sample = rownames(pca$x),
+                         pca$x,
+                         Species = meta$species)
+# Make sure PCA was computed
+pca <- prcomp(mat_t, scale. = TRUE)
+
+# Create a data frame with PC coordinates + metadata
+pca_export <- data.frame(
+  Sample = rownames(pca$x),
+  pca$x,
+  Species = meta$species
+)
+
+# Preview
+head(pca_export)
+
+# Save to CSV
+write.csv(
+  pca_export,
+  file = "/Users/valdebenito/Desktop/PSC_PCA_coordinates.csv",
+  row.names = FALSE
+)
