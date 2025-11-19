@@ -1,0 +1,343 @@
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(Matrix)
+  library(dplyr)
+  library(ggplot2)
+  library(openxlsx)
+})
+ data_dir <- " E-MTAB-6967/atlas"  # adjust if needed
+
+ 
+counts <- readMM(file.path(data_dir, "raw_counts.mtx"))
+genes  <- read.delim(file.path(data_dir, "genes.tsv"), header = FALSE)
+meta   <- read.csv(file.path(data_dir, "meta.csv"), header = TRUE, row.names = 1)
+
+ 
+canon <- function(x) {
+  x <- as.character(x)
+  x <- trimws(x)
+  x <- sub("-\\d+$", "", x)                           # strip trailing -1/-2 (10x style)
+  x <- sub("^.*[_:|-]([ACGTN]{10,})$", "\\1", x, perl = TRUE)  # keep barcode tail if prefixed
+  x
+}
+pick_meta_id_column <- function(meta_df, target_n) {
+  preferred_cols <- c("barcode","barcodes","cell","cell_id","CellID","cellID",
+                      "cell_barcode","cell.barcode","Cell.Barcode","Cell")
+  have <- intersect(preferred_cols, colnames(meta_df))
+  candidates <- if (length(have) > 0) have else {
+    names(meta_df)[sapply(meta_df, function(v) is.character(v) || is.factor(v))]
+  }
+  if (length(candidates) == 0) return(list(name = NA_character_, values = NULL, overlap = 0))
+  vals <- lapply(candidates, function(nm) canon(meta_df[[nm]]))
+  # prefer exact length match to the matrix ncol, then max unique
+  scores <- vapply(vals, function(v) sum(!is.na(v) & nzchar(v)), integer(1))
+  # best candidate by non-empty count; if ties, first
+  best_i <- which.max(scores)
+  list(name = candidates[[best_i]], values = vals[[best_i]], overlap = scores[[best_i]])
+}
+
+# ==========================================================
+# 3) FIX: Clean feature (gene) names and set rownames(counts)
+# ==========================================================
+stopifnot(nrow(genes) == nrow(counts))  # rows must match
+
+symbol_col  <- if ("V2" %in% colnames(genes)) genes$V2 else NULL
+ensembl_col <- if ("V1" %in% colnames(genes)) genes$V1 else NULL
+
+feat <- symbol_col
+if (!is.null(ensembl_col)) {
+  bad <- is.na(feat) | feat == "" | feat == "NA"
+  feat[bad] <- ensembl_col[bad]
+}
+bad <- is.na(feat) | feat == "" | feat == "NA"
+if (any(bad)) feat[bad] <- paste0("ENS_UNKNOWN_", which(bad))
+feat <- make.unique(feat)
+rownames(counts) <- feat
+
+# # Try barcodes.tsv; otherwise common alternates; otherwise derive from meta or length
+bc_files <- c("barcodes.tsv","barcodes.txt","barcodes.csv","cells.tsv",
+              "cell_barcodes.tsv","cell_ids.tsv","cellnames.tsv","colnames.tsv")
+bc_path <- NULL
+for (f in bc_files) {
+  p <- file.path(data_dir, f)
+  if (file.exists(p)) { bc_path <- p; break }
+}
+
+if (!is.null(bc_path)) {
+  message("🔎 Using barcodes from: ", basename(bc_path))
+  tmp <- read.delim(bc_path, header = FALSE, col.names = "barcode")
+  stopifnot(ncol(counts) == nrow(tmp))
+  colnames(counts) <- tmp$barcode
+} else {
+  message("⚠️ No barcodes file found. Attempting to derive barcodes from metadata...")
+  # Try to use a column from meta as barcodes
+  picked <- pick_meta_id_column(meta, ncol(counts))
+  if (!is.null(picked$values) && length(picked$values) == nrow(meta)) {
+    # if length matches number of rows in meta, we still need to map to counts
+    # If counts has no colnames, we can tentatively set them to meta IDs if sizes match
+    if (ncol(counts) == nrow(meta)) {
+      colnames(counts) <- picked$values
+      message("✅ Set counts colnames from meta column: ", picked$name)
+    } else {
+      # fall back: try rownames(meta) if that helps
+      if (ncol(counts) == nrow(meta)) {
+        colnames(counts) <- rownames(meta)
+        message("✅ Set counts colnames from meta rownames (sizes matched).")
+      } else {
+        stop("Could not determine cell barcodes: counts columns != meta rows, and no barcodes file.")
+      }
+    }
+  } else if (ncol(counts) == nrow(meta)) {
+    colnames(counts) <- rownames(meta)
+    message("✅ Set counts colnames from meta rownames (sizes matched).")
+  } else {
+    stop("Could not determine cell barcodes: no barcodes file; meta does not provide a usable ID column; ",
+         "and ncol(counts) != nrow(meta).")
+  }
+}
+
+ barcodes_clean <- canon(colnames(counts))
+
+# choose best meta IDs (column or rownames)
+preferred_cols <- c("barcode","barcodes","cell","cell_id","CellID","cellID",
+                    "cell_barcode","cell.barcode","Cell.Barcode","Cell")
+have <- intersect(preferred_cols, colnames(meta))
+if (length(have) > 0) {
+  meta_ids <- canon(meta[[have[1]]])
+  meta_label <- have[1]
+} else {
+  meta_ids <- canon(rownames(meta))
+  meta_label <- "(rownames)"
+}
+
+common <- intersect(barcodes_clean, meta_ids)
+if (length(common) == 0) {
+  # last-resort: if lengths match exactly, align by position
+  if (length(barcodes_clean) == length(meta_ids)) {
+    message("⚠️ No textual overlap; aligning by position (counts columns ↔ meta rows).")
+    common <- barcodes_clean
+    meta_ids <- meta_ids
+  } else {
+    stop("Error: No overlap between counts colnames and meta (", meta_label, "), and lengths differ.\n",
+         "Check that meta.csv matches this matrix.")
+  }
+}
+
+# Reorder both to the common set
+if (!identical(common, barcodes_clean)) {
+  counts <- counts[, match(common, barcodes_clean), drop = FALSE]
+}
+if (!identical(common, meta_ids)) {
+  meta <- meta[match(common, meta_ids), , drop = FALSE]
+}
+
+# Set final aligned identifiers
+colnames(counts) <- common
+rownames(meta)   <- common
+
+cat("✅ Alignment complete — Features:", nrow(counts),
+    "| Cells:", ncol(counts),
+    "| Meta key used:", meta_label, "\n")
+
+# ==========================================================
+# 6) Create Seurat object + QC features
+# ==========================================================
+seu <- CreateSeuratObject(counts = counts, meta.data = meta, project = "E_MTAB_6967")
+
+# Mito pattern: try both mouse and human automatically
+mt_pat <- if (any(grepl("^mt-", rownames(seu), ignore.case = FALSE))) "^mt-" else "^MT-"
+seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = mt_pat)
+DefaultAssay(seu) <- "RNA"
+
+ 
+seu <- NormalizeData(seu, normalization.method = "LogNormalize",
+                     scale.factor = 10000, verbose = FALSE)
+seu <- FindVariableFeatures(seu, selection.method = "vst",
+                            nfeatures = 2000, verbose = FALSE)
+seu <- ScaleData(seu, features = VariableFeatures(seu),
+                 vars.to.regress = c("percent.mt","nCount_RNA"), verbose = FALSE)
+seu <- RunPCA(seu, features = VariableFeatures(seu))
+
+ 
+seu <- FindNeighbors(seu, dims = 1:20)
+seu <- FindClusters(seu, resolution = 0.2)
+seu <- RunUMAP(seu, dims = 1:20, seed.use = 123)
+DimPlot(seu, label = TRUE, repel = TRUE)
+
+ 
+seu_E8 <- subset(seu, subset = stage == "E8.0")
+seu_E8 <- RunUMAP(seu_E8, dims = 1:20, seed.use = 123)
+DimPlot(seu_E8, label = TRUE, repel = TRUE, pt.size = 0.1) +
+  ggtitle("Mouse Gastrulation Atlas - E8.0 Cells Only")
+
+# Expanded UMAP layout (intentionally “open”)
+seu_E8 <- RunUMAP(
+  seu_E8,
+  dims = 1:30,
+  n.neighbors = 35,
+  min.dist = 5,
+  spread = 5,
+  repulsion.strength = 1.0,
+  metric = "cosine",
+  seed.use = 123
+)
+DimPlot(seu_E8, label = FALSE, pt.size = 1.5, raster = TRUE) +
+  theme_void() + theme(legend.position = "none")
+
+ 
+out_dir <- data_dir
+out_png <- file.path(out_dir, "E8_subset_UMAP_clean_highres.png")
+p_E8 <- DimPlot(seu_E8, label = FALSE, pt.size = 0.8, raster = FALSE) +
+  theme_void() + theme(legend.position = "none")
+ggsave(out_png, plot = p_E8, device = "png", width = 10, height = 10, units = "in", dpi = 600, bg = "white")
+message("✅ Saved UMAP to: ", out_png)
+
+ 
+rownames(seu) <- make.unique(rownames(seu))
+Idents(seu_E8) <- seu_E8$seurat_clusters
+
+markers_E8 <- FindAllMarkers(
+  seu_E8, only.pos = TRUE, min.pct = 0.10,
+  logfc.threshold = 0.15, test.use = "wilcox"
+) %>% arrange(cluster, p_val_adj)
+
+top50_E8 <- markers_E8 %>%
+  group_by(cluster) %>%
+  slice_max(order_by = avg_log2FC, n = 100, with_ties = FALSE) %>%
+  ungroup()
+
+xlsx_path <- file.path(out_dir, "E8_Markers.xlsx")
+wb <- createWorkbook()
+addWorksheet(wb, "Top100_all_clusters")
+writeData(wb, "Top100_all_clusters", top50_E8)
+
+for (cl in unique(markers_E8$cluster)) {
+  sh <- gsub("[\\/:?*\\[\\]]", "_", substr(paste0("Cluster_", cl), 1, 31))
+  addWorksheet(wb, sh)
+  writeData(wb, sh, dplyr::filter(markers_E8, cluster == cl))
+}
+saveWorkbook(wb, xlsx_path, overwrite = TRUE)
+message("✅ Marker Excel saved: ", xlsx_path)
+
+ 
+resolve_feature <- function(GENE, seu_obj, genes_df = NULL) {
+  rn <- rownames(seu_obj)
+  feat <- rn[tolower(rn) == tolower(GENE)]  # symbol match
+  if (length(feat) == 0 && !is.null(genes_df) && all(c("V1","V2") %in% colnames(genes_df))) {
+    ens_base_obj <- sub("\\..*$", "", rn)
+    gtmp <- genes_df
+    gtmp$ensembl_base <- sub("\\..*$", "", gtmp$V1)
+    idx <- which(toupper(gtmp$V2) == toupper(GENE))
+    if (length(idx) >= 1) {
+      ens_target <- gtmp$ensembl_base[idx[1]]
+      feat <- rn[ens_base_obj == ens_target]
+    }
+  }
+  if (length(feat) == 0 && grepl("^ENSMUSG", toupper(GENE))) {
+    ens_base_obj <- sub("\\..*$", "", rn)
+    feat <- rn[ens_base_obj == sub("\\..*$", "", GENE)]
+  }
+  if (length(feat) == 0) stop("Gene not found: ", GENE)
+  feat[1]
+}
+
+plot_gene_clean <- function(seu_obj, gene_feature) {
+  FeaturePlot(
+    seu_obj,
+    features = gene_feature,
+    pt.size = 1.5,
+    order = TRUE,
+    raster = TRUE,
+    min.cutoff = "q05",
+    max.cutoff = "q95"
+  ) +
+    ggtitle(NULL) +                 # ⬅️ removes the title completely
+    theme_void() +
+    theme(
+      legend.position = "none",
+      plot.title = element_blank()  # ⬅️ extra guarantee: blank title
+    )
+}
+# === Run for one gene ===
+GENE <- "gpd1L"  # change here
+feat <- resolve_feature(GENE, seu_E8, genes)
+p <- plot_gene_clean(seu_E8, feat)
+print(p)
+cat("✅ Plotted gene:", GENE, "→ feature used:", feat, "\n")
+
+# === Save high-res ===
+one_png <- file.path(out_dir, paste0("E8_one_gene_", GENE, "_highres.png"))
+
+p_gene <- FeaturePlot(
+  seu_E8,
+  features = feat,
+  pt.size = 1.5,
+  order = TRUE,
+  raster = FALSE,
+  min.cutoff = "q05",
+  max.cutoff = "q95"
+) +
+  scale_color_gradientn(
+    colours = c("lightgrey", "purple", "purple"),   # grey → pink → red
+    limits = c(NA, NA),
+    name = NULL
+  ) +
+  ggtitle(NULL) +
+  theme_void() +
+  theme(
+    legend.position = "none",
+    plot.title = element_blank()
+  )
+
+ggsave(
+  one_png,
+  plot = p_gene,
+  width = 10,
+  height = 10,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+message("✅ Saved one-gene UMAP with pink→red gradient to: ", one_png)
+ 
+
+# ecto_clusters <- c("1")
+# meso_clusters <- c("6","9")
+# endo_clusters <- c("2","3","4","5","7","8","11","12")
+# cl_char <- as.character(seu_E8$seurat_clusters)
+# germ <- ifelse(cl_char %in% meso_clusters, "Mesoderm",
+#         ifelse(cl_char %in% ecto_clusters, "Ectoderm",
+#         ifelse(cl_char %in% endo_clusters, "Endoderm", "Other")))
+# seu_E8$germ_layer <- factor(germ, levels = c("Endoderm","Mesoderm","Ectoderm","Other"))
+# cols_germ <- c("Endoderm"="#E64B35","Mesoderm"="#4DBBD5","Ectoderm"="#00A087","Other"="grey80")
+
+# Build the single merged plot
+p_merged <- DimPlot(
+  seu_E8,
+  group.by = "germ_layer",
+  label = FALSE,
+  pt.size = 0.8,
+  raster = FALSE,         # non-raster for max sharpness in high-res
+  cols = cols_germ
+) +
+  ggtitle(NULL) +
+  theme_void() +
+  theme(legend.position = "none")
+
+print(p_merged)
+
+# Save one high-res image (and optional PDF)
+out_dir <- data_dir
+merged_png <- file.path(out_dir, "E8_UMAP_germ_layers_MERGED.png")
+merged_pdf <- file.path(out_dir, "E8_UMAP_germ_layers_MERGED.pdf")
+
+ggsave(merged_png, plot = p_merged, device = "png",
+       width = 10, height = 10, units = "in", dpi = 600, bg = "white")
+ggsave(merged_pdf, plot = p_merged, device = "pdf",
+       width = 10, height = 10, units = "in", dpi = 600, bg = "white")
+
+message("✅ Saved ONE merged high-res UMAP to: ", merged_png, " (and PDF).")
+
+
+ 
